@@ -219,3 +219,4 @@ __marimo__/
 data/my_transactions*.csv
 data/*_raw.csv
 data/price_cache.csv
+reports/*.png
