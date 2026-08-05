@@ -132,9 +132,18 @@ def position_contribution(
     first_day = daily_holdings["date"].min()
     last_day = daily_holdings["date"].max()
 
+    # Forward/back-fill prices across the full holdings date range so a
+    # lookup for "today" still resolves to the most recent close, rather
+    # than requiring an exact date match (which fails whenever today's
+    # close isn't published yet -- silently dropping every still-open
+    # position from this table while closed ones, whose end date is safely
+    # in the past, would appear fine).
+    full_range = pd.date_range(min(first_day, prices.index.min()), max(last_day, prices.index.max()), freq="D")
+    prices_filled = prices.reindex(full_range).ffill().bfill()
+
     rows = []
     for ticker, group in daily_holdings.groupby("ticker"):
-        if ticker not in prices.columns:
+        if ticker not in prices_filled.columns:
             continue
 
         first_qty_rows = group[group["date"] == group["date"].min()]
@@ -145,11 +154,11 @@ def position_contribution(
         end_date = last_qty_rows["date"].iloc[0]
         end_qty = last_qty_rows["quantity"].iloc[0]
 
-        if start_date not in prices.index or end_date not in prices.index:
-            continue
+        start_price = prices_filled.loc[start_date, ticker]
+        end_price = prices_filled.loc[end_date, ticker]
 
-        start_price = prices.loc[start_date, ticker]
-        end_price = prices.loc[end_date, ticker]
+        if pd.isna(start_price) or pd.isna(end_price):
+            continue  # genuinely no price data anywhere near this ticker's range
 
         start_value = start_qty * start_price
         end_value = end_qty * end_price
