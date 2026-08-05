@@ -26,10 +26,14 @@ done better just buying the index?**
 ```
                       Final value    Contributed            P/L    Return    vs Portfolio
 -----------------------------------------------------------------------------------------
-Portfolio               $3,159.85      $2,800.00       $+359.85   +12.85%
-S&P 500 (SPY)           $2,968.15      $2,800.00       $+168.15    +6.01%        $+191.70
-Nasdaq 100 (QQQ)        $3,311.75      $2,800.00       $+511.75   +18.28%        $-151.90
+Portfolio               $6,174.44      $3,767.14      $+2,407.30   +63.90%
+S&P 500 (SPY)           $4,320.02      $3,767.14        $+552.88   +14.68%      $+1,854.42
+Nasdaq 100 (QQQ)        $4,420.54      $3,767.14        $+653.40   +17.34%      $+1,753.90
 ```
+
+*(Output of `python src/benchmark.py data/sample_transactions.csv` — the
+sample data is synthetic, so these figures illustrate the format rather
+than any real performance.)*
 
 ![Portfolio vs benchmarks](reports/portfolio_vs_benchmarks_sample.png)
 
