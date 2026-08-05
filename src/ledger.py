@@ -38,13 +38,18 @@ class Lot:
         self.price = price
 
 
-def build_ledger(transactions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_ledger(
+    transactions: pd.DataFrame, as_of: pd.Timestamp | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Process transactions in date order and return (trade_log, daily_holdings).
 
     trade_log: one row per transaction, annotated with realised P&L for sells.
     daily_holdings: one row per (date, ticker) with quantity held and cost basis,
-        covering every calendar day from the first transaction to the last
-        (holdings carried forward on days with no activity for that ticker).
+        covering every calendar day from the first transaction up to `as_of`
+        (defaults to today), carrying holdings forward on days with no
+        activity -- including all days after the last transaction, since a
+        position you haven't sold is still held even once trading has quieted
+        down for a while.
     """
     open_lots: dict[str, deque[Lot]] = defaultdict(deque)
     trade_rows = []
@@ -75,7 +80,7 @@ def build_ledger(transactions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
             trade_rows.append({**txn, "realised_pnl": None, "cost_basis_sold": None})
 
     trade_log = pd.DataFrame(trade_rows)
-    daily_holdings = _snapshot_daily(transactions, open_lots, trade_log)
+    daily_holdings = _snapshot_daily(transactions, trade_log, as_of=as_of)
     return trade_log, daily_holdings
 
 
@@ -110,18 +115,20 @@ def _consume_fifo(
 
 def _snapshot_daily(
     transactions: pd.DataFrame,
-    final_open_lots: dict[str, deque[Lot]],
     trade_log: pd.DataFrame,
+    as_of: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Reconstruct, for every calendar day and every ticker ever traded,
     the shares held and their cost basis -- by replaying transactions
-    day by day rather than relying on the already-mutated `final_open_lots`.
+    day by day. Extends through `as_of` (default: today) so a quiet period
+    after the last transaction still reports the position being carried,
+    rather than the data simply stopping.
     """
     tickers = transactions["ticker"].unique()
-    all_days = pd.date_range(transactions["date"].min(), transactions["date"].max(), freq="D")
+    end_date = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today().normalize()
+    end_date = max(end_date, transactions["date"].max())  # never truncate real history
+    all_days = pd.date_range(transactions["date"].min(), end_date, freq="D")
 
-    # Replay independently of build_ledger's mutation, so this function
-    # is correct even if called on its own.
     running_lots: dict[str, deque[Lot]] = defaultdict(deque)
     rows = []
 
