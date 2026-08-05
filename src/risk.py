@@ -1,19 +1,23 @@
 """
 Risk metrics computed from a daily portfolio value series.
 
-All of these are computed on daily returns derived from `total_value`,
-NOT time-weighted returns -- for risk metrics (volatility, drawdown) you
-want the return series as actually experienced day to day, including the
-effect of cash flows, because that's the risk you actually lived through.
-This is a deliberate difference from returns.py's TWR, which exists
-specifically to strip cash flow timing out. Mixing the two purposes into
-one return series would misrepresent both.
+IMPORTANT: these must be computed on a *cash-flow-adjusted* return series,
+not on raw portfolio value. Raw value jumps whenever money is deposited or
+withdrawn, and a naive pct_change() reads a deposit as an enormous one-day
+gain. For a portfolio funded by regular contributions that inflates
+volatility, distorts Sharpe, and masks real drawdowns -- it measures the
+deposit schedule rather than market risk.
+
+The fix is `index_series`: a synthetic unit price (like a fund's NAV per
+share) that starts at 100 and moves only when markets move. Pass
+`transactions` to any function here to get the adjusted figure; omit it
+only when the series is already known to be free of external cash flows.
 
 Usage:
-    from risk import (
-        annualised_volatility, sharpe_ratio, max_drawdown,
-        rolling_beta, position_contribution,
-    )
+    from risk import annualised_volatility, sharpe_ratio, max_drawdown
+
+    vol = annualised_volatility(portfolio["total_value"], transactions)
+    dd, peak, trough = max_drawdown(portfolio["total_value"], transactions)
 """
 
 import numpy as np
@@ -22,21 +26,90 @@ import pandas as pd
 TRADING_DAYS_PER_YEAR = 252
 
 
-def daily_returns(value: pd.Series) -> pd.Series:
-    """Simple day-over-day percentage change. First entry is dropped (no
-    prior value to compare against)."""
-    return value.pct_change().dropna()
+def _external_cashflows(transactions: pd.DataFrame, index: pd.DatetimeIndex) -> pd.Series:
+    """Net cash added to the portfolio per day, aligned to `index`.
+
+    Positive means the investor put money in (a BUY); negative means they
+    took money out (a SELL). Mirrors returns.compute_external_cashflows;
+    duplicated here so risk.py doesn't depend on returns.py.
+    """
+    trades = transactions[transactions["action"].isin(["BUY", "SELL"])]
+    if trades.empty:
+        return pd.Series(0.0, index=index)
+
+    signed = trades.apply(
+        lambda r: (r["quantity"] * r["price"] + r["fees"])
+        if r["action"] == "BUY"
+        else -(r["quantity"] * r["price"] - r["fees"]),
+        axis=1,
+    )
+    per_day = signed.groupby(trades["date"]).sum()
+    return per_day.reindex(index, fill_value=0.0)
 
 
-def annualised_volatility(value: pd.Series) -> float:
+def daily_returns(
+    value: pd.Series, transactions: pd.DataFrame | None = None
+) -> pd.Series:
+    """Day-over-day return, excluding the effect of deposits and withdrawals.
+
+    With `transactions`, each day's return is (change in value minus net
+    cash added) / previous value -- so contributing money is correctly
+    treated as a zero-return event rather than a gain. Without it, this
+    falls back to a plain pct_change(), which is only valid when no
+    external cash flows occurred.
+    """
+    if transactions is None:
+        return value.pct_change().dropna()
+
+    flows = _external_cashflows(transactions, value.index)
+    prev = value.shift(1)
+    adjusted = (value - prev - flows) / prev
+
+    # Days before any position existed have no base to measure against.
+    adjusted = adjusted[prev > 0]
+    return adjusted.dropna()
+
+
+def index_series(
+    value: pd.Series, transactions: pd.DataFrame | None = None, base: float = 100.0
+) -> pd.Series:
+    """A synthetic unit-price series: what one 'share' of this portfolio
+    would be worth if it started at `base` and no money were ever added
+    or removed. Drawdowns measured on this reflect market losses rather
+    than the shape of the contribution schedule.
+    """
+    returns = daily_returns(value, transactions)
+    compounded = base * (1 + returns).cumprod()
+
+    # Prepend the opening level. Without it the series starts at its first
+    # *post-return* value, so a portfolio that only ever fell would show no
+    # drawdown at all -- there'd be no peak above it to measure from.
+    if len(returns) == 0:
+        return pd.Series([base], index=value.index[:1])
+
+    first_date = value.index[value.index.get_loc(returns.index[0]) - 1]
+    opening = pd.Series([base], index=[first_date])
+    return pd.concat([opening, compounded])
+
+
+def annualised_volatility(
+    value: pd.Series, transactions: pd.DataFrame | None = None
+) -> float:
     """Standard deviation of daily returns, scaled to an annual figure by
     the sqrt(time) rule -- this assumes returns are roughly independent
-    day to day, which is a standard simplification, not a guarantee."""
-    returns = daily_returns(value)
+    day to day, which is a standard simplification, not a guarantee.
+
+    Pass `transactions` so deposits aren't counted as volatility.
+    """
+    returns = daily_returns(value, transactions)
     return returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
 
-def sharpe_ratio(value: pd.Series, risk_free_rate: float = 0.0) -> float:
+def sharpe_ratio(
+    value: pd.Series,
+    transactions: pd.DataFrame | None = None,
+    risk_free_rate: float = 0.0,
+) -> float:
     """Annualised Sharpe ratio: excess return over the risk-free rate,
     divided by annualised volatility.
 
@@ -45,7 +118,7 @@ def sharpe_ratio(value: pd.Series, risk_free_rate: float = 0.0) -> float:
     a safe default once rates are meaningfully above zero, so it's worth
     passing the current rate explicitly rather than relying on the default.
     """
-    returns = daily_returns(value)
+    returns = daily_returns(value, transactions)
     vol = returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     if vol < 1e-10:
         return float("nan")  # undefined, not zero -- a flat series has no ratio
@@ -53,13 +126,22 @@ def sharpe_ratio(value: pd.Series, risk_free_rate: float = 0.0) -> float:
     return (annualised_return - risk_free_rate) / vol
 
 
-def max_drawdown(value: pd.Series) -> tuple[float, pd.Timestamp | None, pd.Timestamp | None]:
+def max_drawdown(
+    value: pd.Series, transactions: pd.DataFrame | None = None
+) -> tuple[float, pd.Timestamp | None, pd.Timestamp | None]:
     """Largest peak-to-trough decline.
 
     Returns (drawdown_pct, peak_date, trough_date). drawdown_pct is
     negative (e.g. -0.23 for a 23% decline). If the series never declines,
     returns (0.0, None, None).
+
+    Pass `transactions` so that a deposit isn't mistaken for a recovery:
+    on raw value, adding cash lifts the line and can erase a drawdown that
+    the investor genuinely experienced.
     """
+    if transactions is not None:
+        value = index_series(value, transactions)
+
     running_peak = value.cummax()
     drawdown = value / running_peak - 1.0
 
@@ -74,13 +156,20 @@ def max_drawdown(value: pd.Series) -> tuple[float, pd.Timestamp | None, pd.Times
     return trough_value, peak_date, trough_date
 
 
-def drawdown_duration(value: pd.Series) -> int:
+def drawdown_duration(
+    value: pd.Series, transactions: pd.DataFrame | None = None
+) -> int:
     """Length, in calendar days, of the longest stretch spent below a prior
-    peak (i.e. time from a peak until the value fully recovers past it).
+    peak (i.e. time from a peak until the value recovers to it).
     Returns 0 if the series is non-decreasing throughout. If the series
     ends still in a drawdown, that unfinished stretch counts too -- it's
     real underwater time even without a recovery date yet.
+
+    Pass `transactions` for the same reason as max_drawdown.
     """
+    if transactions is not None:
+        value = index_series(value, transactions)
+
     running_peak = value.cummax()
     underwater = value < running_peak
 
@@ -99,15 +188,19 @@ def drawdown_duration(value: pd.Series) -> int:
 
 
 def rolling_beta(
-    portfolio_value: pd.Series, benchmark_value: pd.Series, window: int = 60
+    portfolio_value: pd.Series,
+    benchmark_value: pd.Series,
+    window: int = 60,
+    transactions: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Rolling beta of the portfolio against a benchmark over `window` days.
 
     Both series must share a comparable date index; they're aligned by
     inner join before computing, so mismatched date ranges don't silently
-    produce NaNs everywhere.
+    produce NaNs everywhere. The benchmark is a price series with no cash
+    flows, so only the portfolio side needs adjusting.
     """
-    port_returns = daily_returns(portfolio_value)
+    port_returns = daily_returns(portfolio_value, transactions)
     bench_returns = daily_returns(benchmark_value)
     aligned = pd.concat([port_returns, bench_returns], axis=1, join="inner")
     aligned.columns = ["portfolio", "benchmark"]
@@ -174,6 +267,21 @@ def position_contribution(
         )
 
     contrib = pd.DataFrame(rows)
+    if contrib.empty:
+        # No position had usable price data. Return the expected shape rather
+        # than an empty frame with no columns, so callers can filter, sort,
+        # or display the result without special-casing this.
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "start_value",
+                "end_value",
+                "position_return",
+                "weight",
+                "contribution",
+            ]
+        )
+
     total_start_value = contrib["start_value"].sum()
     contrib["weight"] = contrib["start_value"] / total_start_value
     contrib["contribution"] = contrib["weight"] * contrib["position_return"]
@@ -198,10 +306,12 @@ if __name__ == "__main__":
     price_data = get_prices(tickers, start=str(txns["date"].min().date()))
     portfolio = value_portfolio(daily_holdings, price_data)
 
-    vol = annualised_volatility(portfolio["total_value"])
-    sharpe = sharpe_ratio(portfolio["total_value"])
-    dd, peak, trough = max_drawdown(portfolio["total_value"])
-    dd_days = drawdown_duration(portfolio["total_value"])
+    # Passing `txns` is what makes these figures measure market risk rather
+    # than the shape of the contribution schedule.
+    vol = annualised_volatility(portfolio["total_value"], txns)
+    sharpe = sharpe_ratio(portfolio["total_value"], txns)
+    dd, peak, trough = max_drawdown(portfolio["total_value"], txns)
+    dd_days = drawdown_duration(portfolio["total_value"], txns)
 
     print(f"Annualised volatility: {vol:.2%}")
     print(f"Sharpe ratio:          {sharpe:.2f}")
