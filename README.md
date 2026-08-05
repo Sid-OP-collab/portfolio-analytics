@@ -18,6 +18,26 @@ broker app separates those two things. This does.
 *(Chart generated from the included sample data — real personal trading
 data is excluded from this repo; see [Privacy](#privacy--data) below.)*
 
+## Benchmarking against the index
+
+The tool answers the question most portfolio trackers dodge: **would I have
+done better just buying the index?**
+
+```
+                      Final value    Contributed            P/L    Return    vs Portfolio
+-----------------------------------------------------------------------------------------
+Portfolio               $3,159.85      $2,800.00       $+359.85   +12.85%
+S&P 500 (SPY)           $2,968.15      $2,800.00       $+168.15    +6.01%        $+191.70
+Nasdaq 100 (QQQ)        $3,311.75      $2,800.00       $+511.75   +18.28%        $-151.90
+```
+
+![Portfolio vs benchmarks](reports/portfolio_vs_benchmarks_sample.png)
+
+The chart shows both views: absolute value (where the step-jumps are
+deposits, not gains — hence the contributed-capital line) and return on
+contributed capital, which strips out portfolio size so the three lines
+are directly comparable.
+
 ## What it does
 
 - **Reconstructs holdings day by day** from a raw transaction log (buys,
@@ -39,9 +59,14 @@ data is excluded from this repo; see [Privacy](#privacy--data) below.)*
   beta against a benchmark.
 - **Per-position return attribution** — which holdings actually drove the
   overall return, separating "big position" from "good position."
-- **65 automated tests** (`pytest`, run on every push via GitHub Actions),
+- **Benchmark comparison against the S&P 500 and Nasdaq 100**, on
+  *matched cash flows* — it simulates buying the index with exactly the
+  same money on exactly the same dates, rather than quoting the index's
+  headline return. See [Design decisions](#design-decisions) for why that
+  distinction matters.
+- **75 automated tests** (`pytest`, run on every push via GitHub Actions),
   including regression tests for two real bugs caught during development
-  (see [Known limitations](#known-limitations--design-decisions)).
+  (see [Known limitations](#known-limitations)).
 
 ## Quick start
 
@@ -56,6 +81,8 @@ python src/valuation.py data/sample_transactions.csv   # portfolio value over ti
 python src/returns.py data/sample_transactions.csv      # TWR and XIRR
 python src/risk.py data/sample_transactions.csv         # volatility, Sharpe, drawdown, attribution
 python src/plot_portfolio.py data/sample_transactions.csv  # saves a chart to reports/
+python src/benchmark.py data/sample_transactions.csv       # vs S&P 500 and Nasdaq 100
+python src/plot_benchmark.py data/sample_transactions.csv  # benchmark comparison chart
 ```
 
 Run the tests:
@@ -94,7 +121,9 @@ loader.py       Reads and validates a transaction CSV
         -> valuation.py   Joins holdings to prices -> daily portfolio value
             -> returns.py     TWR and XIRR
             -> risk.py        Volatility, Sharpe, drawdown, attribution
-            -> plot_portfolio.py   Chart generation
+            -> benchmark.py   Cash-flow-matched comparison vs SPY / QQQ
+            -> plot_portfolio.py    Portfolio value chart
+            -> plot_benchmark.py    Portfolio vs benchmarks chart
 prices.py       Fetches and caches daily closes via yfinance
 ```
 
@@ -122,6 +151,21 @@ rising, so my money-weighted return benefited from timing that my
 stock-picking (measured by TWR) doesn't get credit for. A single "return"
 figure would have hidden that entirely.
 
+**Why benchmarks are compared on matched cash flows, not headline returns.**
+Saying "the S&P returned 12% and I returned 20%" is not a fair comparison
+if the money arrived gradually. An index that rose 12% over the period did
+not rise 12% on capital that only showed up last month — so quoting the
+full-period figure overstates what an index investor with the same deposit
+schedule would actually have earned. Instead, `benchmark.py` simulates
+buying the index with each contribution on the day it was made, which makes
+the two sides answer the same question. Two related choices: it uses ETFs
+(SPY, QQQ) rather than raw index levels (^GSPC, ^NDX), because ETF prices
+are what an investor could actually have bought and, adjusted, include
+dividends — an index price level doesn't, which would quietly flatter the
+portfolio; and dividends received are excluded from contributed capital,
+since they're internally generated rather than new money the investor
+added.
+
 **Why risk metrics are computed on a cash-flow-adjusted series, not raw
 value.** This was a real bug caught while testing against my own data:
 volatility, Sharpe, and drawdown were originally computed directly on
@@ -148,6 +192,10 @@ down so it can't silently regress.
   held date, not a true daily-weighted calculation — the standard
   simplification for a summary table, but not exact if a position was
   added to gradually over a long period.
+- **The benchmark simulation ignores trading costs and assumes fractional
+  units.** Both are generous to the benchmark rather than to the portfolio,
+  so the comparison isn't flattering itself — but a real index investor
+  would face spreads and, historically, whole-share constraints.
 - **No tax handling, no FX/multi-currency support**, and corporate actions
   beyond simple splits (e.g. spin-offs, mergers) aren't handled.
 - **XIRR can be undefined for very short holding periods** (a few days) —
